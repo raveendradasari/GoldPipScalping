@@ -10,8 +10,9 @@
 //|  other is cancelled the same instant.                            |
 //|                                                                  |
 //|  THE CYCLE                                                       |
-//|    1. flat  ->  buy stop  = ASK + InpDistance                    |
-//|                 sell stop = BID - InpDistance                    |
+//|    1. flat  ->  mid  = (BID + ASK) / 2                           |
+//|                 half = InpDistance + spread x InpSpreadPad       |
+//|                 buy stop = mid + half,  sell stop = mid - half   |
 //|                 both at InpLot, both with NO stop loss on them   |
 //|    2. one fills  ->  the other is deleted (OCO) and the stop     |
 //|                      loss is attached to the new position        |
@@ -32,11 +33,17 @@
 //|    down on a pullback, which is the one thing a trailing stop     |
 //|    must never do.                                                |
 //|                                                                  |
-//|    With the defaults (start 50, trail 20) the stop's first jump   |
-//|    lands 30 points IN PROFIT. That is why a trade can only ever   |
-//|    end at -InpStopLoss or at +30 points or better: there is no    |
-//|    such thing as a small loser here, and no such thing as a       |
-//|    breakeven scratch.                                             |
+//|    With the defaults (start 30, trail 30) the stop's first jump   |
+//|    lands at BREAKEVEN, and the trail then follows a full 30       |
+//|    points behind. That combination is the point of the whole      |
+//|    system: it stops paying the full stop loss as soon as the      |
+//|    trade has shown 30 points, WITHOUT strangling the winner - a   |
+//|    small InpTrailStop would lock more but exit on the first       |
+//|    wobble, which is a different, much worse strategy.             |
+//|    Measured live against the reference EA on the same tick: it    |
+//|    banked +0.04 and re-armed while a 50/20 build was still stuck  |
+//|    in the same trade at -0.28 and falling - the loss AND every    |
+//|    trade it could not take while it sat there.                    |
 //|                                                                  |
 //|  LOT is FIXED. No martingale, no recovery ladder, no doubling.    |
 //|                                                                  |
@@ -51,7 +58,7 @@
 #property link      ""
 //--- ONE place for the build number. The panel prints it, so which .ex5 is
 //    actually loaded is readable off the chart.
-#define  EA_VER "1.00"
+#define  EA_VER "1.01"
 #property version   EA_VER
 #property strict
 
@@ -84,13 +91,26 @@
 //|  and the print is what makes that obvious before it trades.       |
 //+------------------------------------------------------------------+
 input group "=== Straddle ==="
-input int    InpDistance     = 100;   // stop orders this far EACH SIDE of price
+input int    InpDistance     = 100;   // stop orders this far EACH SIDE of the mid
+//--- The straddle is measured from the MID and the spread is paid for on top,
+//    because each leg has to clear the spread before it is a real breakout.
+//        half leg = InpDistance + spread x InpSpreadPad
+//    1.0 puts a whole spread on each side (total width = 2xDistance + 2xspread);
+//    0.5 reproduces the plain "buy = Ask + Distance, sell = Bid - Distance".
+//    Measured on the reference account: widths of 2.20 at a 0.10 spread and
+//    2.22 at 0.11 - both exactly 2.00 + 2 x spread, i.e. InpSpreadPad = 1.0.
+input double InpSpreadPad    = 1.0;   // spreads added to EACH leg (1.0 = ref EA)
 input double InpLot          = 0.01;  // fixed lot - no progression
 
 input group "=== Exit  (there is no take profit) ==="
 input int    InpStopLoss     = 100;   // initial stop, from the fill price
-input int    InpTrailStart   = 50;    // profit needed before the stop moves at all
-input int    InpTrailStop    = 20;    // stop follows this far behind the PEAK
+//--- TrailStart == TrailStop is the reference EA's setting and is deliberate:
+//    the stop's first landing is (TrailStart - TrailStop) = 0, i.e. BREAKEVEN.
+//    It buys protection early and then trails a full TrailStop behind the peak,
+//    so winners are still given room. Do not confuse it with a small TrailStop,
+//    which locks more but strangles every winner at the first wobble.
+input int    InpTrailStart   = 30;    // profit needed before the stop moves at all
+input int    InpTrailStop    = 30;    // stop follows this far behind the PEAK
 input int    InpTrailStep    = 1;     // ignore improvements smaller than this
 
 input group "=== Safety ==="
@@ -354,8 +374,14 @@ void PlaceStraddle()
    double lot = NormalizeLot(InpLot);
    if(lot <= 0) return;
 
-   double buyPx  = Nz(ask + g_dist);
-   double sellPx = Nz(bid - g_dist);
+   //--- Measured from the MID, with the spread paid for on top. Anchoring the
+   //    buy to the Ask and the sell to the Bid (the old way) makes the two legs
+   //    sit at different distances from the mid whenever the spread is not
+   //    zero, and it under-reaches by half a spread on each side.
+   double mid  = (bid + ask) * 0.5;
+   double half = g_dist + (ask - bid) * InpSpreadPad;
+   double buyPx  = Nz(mid + half);
+   double sellPx = Nz(mid - half);
 
    //--- a pending must sit at least the stops level away from the market. The
    //    straddle distance is normally far bigger, but a broker that widens the
@@ -865,14 +891,15 @@ int OnInit()
    { Print("[SCP] InpLot must be > 0"); return INIT_PARAMETERS_INCORRECT; }
    if(InpDistance <= 0 || InpStopLoss <= 0)
    { Print("[SCP] InpDistance and InpStopLoss must be > 0"); return INIT_PARAMETERS_INCORRECT; }
-   if(InpTrailStop >= InpTrailStart)
+   if(InpTrailStop > InpTrailStart)
    {
-      //--- the stop's first landing is InpTrailStart - InpTrailStop. If that is
-      //    zero or negative the "trail" locks in a loss and the whole point of
-      //    the rule is gone.
-      Print("[SCP] InpTrailStop (", InpTrailStop, ") must be SMALLER than "
-            "InpTrailStart (", InpTrailStart, ") - otherwise the first trail "
-            "step locks in a loss instead of a profit");
+      //--- The first landing is (TrailStart - TrailStop). Zero is BREAKEVEN and
+      //    is the reference EA's own setting, so equal values are allowed.
+      //    Negative is not: the "trail" would move the stop to a level that is
+      //    still a loss, which is worse than leaving the initial stop alone.
+      Print("[SCP] InpTrailStop (", InpTrailStop, ") is LARGER than "
+            "InpTrailStart (", InpTrailStart, ") - the first trail step would "
+            "land at a LOSS. Equal is fine (breakeven); larger is not.");
       return INIT_PARAMETERS_INCORRECT;
    }
 
@@ -921,13 +948,24 @@ int OnInit()
 
    Print("[SCP] BUILD v", EA_VER, "  magic ", InpMagic, "  ", g_symbol,
          "  digits ", g_digits);
-   Print("[SCP] straddle +/-", InpDistance, " pts (",
-         DoubleToString(g_dist, g_digits), ")   lot ", DoubleToString(InpLot, 2),
-         " FIXED");
+   Print("[SCP] straddle  half leg = ", InpDistance, " pts + ",
+         DoubleToString(InpSpreadPad, 2), " x spread from the MID   lot ",
+         DoubleToString(InpLot, 2), " FIXED");
+   {
+      //--- print the width the CURRENT spread would produce, so the number on
+      //    the chart can be checked against the number in the Trade panel
+      double s = Spread();
+      if(s > 0)
+         Print("[SCP] at the spread right now (",
+               DoubleToString(s / g_point, 0), " pts) the straddle would be ",
+               DoubleToString(2.0 * (g_dist + s * InpSpreadPad), g_digits),
+               " wide");
+   }
+   int lock = InpTrailStart - InpTrailStop;
    Print("[SCP] stop ", InpStopLoss, " pts (", DoubleToString(g_sl, g_digits),
          ")   trail starts at ", InpTrailStart, " pts, follows ", InpTrailStop,
-         " pts behind the peak  ->  first lock +",
-         (InpTrailStart - InpTrailStop), " pts");
+         " pts behind the peak  ->  first lock ",
+         (lock == 0 ? "BREAKEVEN" : StringFormat("%+d pts", lock)));
    Print("[SCP] NO take profit. The trailing stop is the only exit.");
    UpdatePanel();
    return INIT_SUCCEEDED;
